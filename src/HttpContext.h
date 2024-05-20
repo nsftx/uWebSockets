@@ -43,6 +43,13 @@ private:
     /* Maximum delay allowed until an HTTP connection is terminated due to outstanding request or rejected data (slow loris protection) */
     static const int HTTP_IDLE_TIMEOUT_S = 10;
 
+    /* Minimum allowed receive throughput per second (clients uploading less than 16kB/sec get dropped) */
+    static const int HTTP_RECEIVE_THROUGHPUT_BYTES = 16 * 1024;
+
+    us_loop_t *getLoop() {
+        return us_socket_context_loop(SSL, getSocketContext());
+    }
+
     us_socket_context_t *getSocketContext() {
         return (us_socket_context_t *) this;
     }
@@ -133,7 +140,7 @@ private:
 #endif
 
             /* The return value is entirely up to us to interpret. The HttpParser only care for whether the returned value is DIFFERENT or not from passed user */
-            void *returnedSocket = httpResponseData->consumePostPadded(data, (unsigned int) length, s, proxyParser, [httpContextData](void *s, HttpRequest *httpRequest) -> void * {
+            auto [err, returnedSocket] = httpResponseData->consumePostPadded(data, (unsigned int) length, s, proxyParser, [httpContextData](void *s, HttpRequest *httpRequest) -> void * {
                 /* For every request we reset the timeout and hang until user makes action */
                 /* Warning: if we are in shutdown state, resetting the timer is a security issue! */
                 us_socket_timeout(SSL, (us_socket_t *) s, 0);
@@ -156,9 +163,18 @@ private:
                     httpResponseData->state |= HttpResponseData<SSL>::HTTP_CONNECTION_CLOSE;
                 }
 
+                /* Select the router based on SNI (only possible for SSL) */
+                auto *selectedRouter = &httpContextData->router;
+                if constexpr (SSL) {
+                    void *domainRouter = us_socket_server_name_userdata(SSL, (struct us_socket_t *) s);
+                    if (domainRouter) {
+                        selectedRouter = (decltype(selectedRouter)) domainRouter;
+                    }
+                }
+
                 /* Route the method and URL */
-                httpContextData->router.getUserData() = {(HttpResponse<SSL> *) s, httpRequest};
-                if (!httpContextData->router.route(httpRequest->getMethod(), httpRequest->getUrl())) {
+                selectedRouter->getUserData() = {(HttpResponse<SSL> *) s, httpRequest};
+                if (!selectedRouter->route(httpRequest->getCaseSensitiveMethod(), httpRequest->getUrl())) {
                     /* We have to force close this socket as we have no handler for it */
                     us_socket_close(SSL, (us_socket_t *) s, 0, nullptr);
                     return nullptr;
@@ -205,7 +221,12 @@ private:
                         us_socket_timeout(SSL, (struct us_socket_t *) user, 0);
                     } else {
                         /* We still have some more data coming in later, so reset timeout */
-                        us_socket_timeout(SSL, (struct us_socket_t *) user, HTTP_IDLE_TIMEOUT_S);
+                        /* Only reset timeout if we got enough bytes (16kb/sec) since last time we reset here */
+                        httpResponseData->received_bytes_per_timeout += (unsigned int) data.length();
+                        if (httpResponseData->received_bytes_per_timeout >= HTTP_RECEIVE_THROUGHPUT_BYTES * HTTP_IDLE_TIMEOUT_S) {
+                            us_socket_timeout(SSL, (struct us_socket_t *) user, HTTP_IDLE_TIMEOUT_S);
+                            httpResponseData->received_bytes_per_timeout = 0;
+                        }
                     }
 
                     /* We might respond in the handler, so do not change timeout after this */
@@ -228,14 +249,21 @@ private:
                     }
                 }
                 return user;
-            }, [](void *user) {
-                 /* Close any socket on HTTP errors */
-                us_socket_close(SSL, (us_socket_t *) user, 0, nullptr);
-                return nullptr;
             });
 
             /* Mark that we are no longer parsing Http */
             httpContextData->isParsingHttp = false;
+
+            /* If we got fullptr that means the parser wants us to close the socket from error (same as calling the errorHandler) */
+            if (returnedSocket == FULLPTR) {
+                /* For errors, we only deliver them "at most once". We don't care if they get halfways delivered or not. */
+                us_socket_write(SSL, s, httpErrorResponses[err].data(), (int) httpErrorResponses[err].length(), false);
+                us_socket_shutdown(SSL, s);
+                /* Close any socket on HTTP errors */
+                us_socket_close(SSL, s, 0, nullptr);
+                /* This just makes the following code act as if the socket was closed from error inside the parser. */
+                returnedSocket = nullptr;
+            }
 
             /* We need to uncork in all cases, except for nullptr (closed socket, or upgraded socket) */
             if (returnedSocket != nullptr) {
@@ -398,15 +426,40 @@ public:
         /* Todo: This is ugly, fix */
         std::vector<std::string> methods;
         if (method == "*") {
-            methods = httpContextData->router.methods;
+            methods = {"*"};
         } else {
             methods = {method};
         }
 
-        httpContextData->router.add(methods, pattern, [handler = std::move(handler)](auto *r) mutable {
+        uint32_t priority = method == "*" ? httpContextData->currentRouter->LOW_PRIORITY : (upgrade ? httpContextData->currentRouter->HIGH_PRIORITY : httpContextData->currentRouter->MEDIUM_PRIORITY);
+
+        /* If we are passed nullptr then remove this */
+        if (!handler) {
+            httpContextData->currentRouter->remove(methods[0], pattern, priority);
+            return;
+        }
+
+        /* Record this route's parameter offsets */
+        std::map<std::string, unsigned short, std::less<>> parameterOffsets;
+        unsigned short offset = 0;
+        for (unsigned int i = 0; i < pattern.length(); i++) {
+            if (pattern[i] == ':') {
+                i++;
+                unsigned int start = i;
+                while (i < pattern.length() && pattern[i] != '/') {
+                    i++;
+                }
+                parameterOffsets[std::string(pattern.data() + start, i - start)] = offset;
+                //std::cout << "<" << std::string(pattern.data() + start, i - start) << "> is offset " << offset;
+                offset++;
+            }
+        }
+
+        httpContextData->currentRouter->add(methods, pattern, [handler = std::move(handler), parameterOffsets = std::move(parameterOffsets)](auto *r) mutable {
             auto user = r->getUserData();
             user.httpRequest->setYield(false);
             user.httpRequest->setParameters(r->getParameters());
+            user.httpRequest->setParameterOffsets(&parameterOffsets);
 
             /* Middleware? Automatically respond to expectations */
             std::string_view expect = user.httpRequest->getHeader("expect");
@@ -421,12 +474,26 @@ public:
                 return false;
             }
             return true;
-        }, method == "*" ? httpContextData->router.LOW_PRIORITY : (upgrade ? httpContextData->router.HIGH_PRIORITY : httpContextData->router.MEDIUM_PRIORITY));
+        }, priority);
     }
 
     /* Listen to port using this HttpContext */
     us_listen_socket_t *listen(const char *host, int port, int options) {
         return us_socket_context_listen(SSL, getSocketContext(), host, port, options, sizeof(HttpResponseData<SSL>));
+    }
+
+    /* Listen to unix domain socket using this HttpContext */
+    us_listen_socket_t *listen(const char *path, int options) {
+        return us_socket_context_listen_unix(SSL, getSocketContext(), path, options, sizeof(HttpResponseData<SSL>));
+    }
+
+    void onPreOpen(LIBUS_SOCKET_DESCRIPTOR (*handler)(LIBUS_SOCKET_DESCRIPTOR)) {
+        us_socket_context_on_pre_open(SSL, getSocketContext(), handler);
+    }
+
+    /* Adopt an externally accepted socket into this HttpContext */
+    us_socket_t *adoptAcceptedSocket(LIBUS_SOCKET_DESCRIPTOR accepted_fd) {
+        return us_adopt_accepted_socket(SSL, getSocketContext(), accepted_fd, sizeof(HttpResponseData<SSL>), 0, 0);
     }
 };
 

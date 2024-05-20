@@ -50,6 +50,7 @@ struct AsyncSocket {
     template <bool> friend struct TemplatedApp;
     template <bool, typename> friend struct WebSocketContextData;
     template <typename, typename> friend struct TopicTree;
+    template <bool> friend struct HttpResponse;
 
 private:
     /* Helper, do not use directly (todo: move to uSockets or de-crazify) */
@@ -120,6 +121,12 @@ protected:
     void corkUnchecked() {
         /* What if another socket is corked? */
         getLoopData()->corkedSocket = this;
+    }
+
+    void uncorkWithoutSending() {
+        if (isCorked()) {
+            getLoopData()->corkedSocket = nullptr;
+        }
     }
 
     /* Cork this socket. Only one socket may ever be corked per-loop at any given time */
@@ -200,9 +207,9 @@ protected:
         unsigned char *b = (unsigned char *) binary.data();
 
         if (binary.length() == 4) {
-            ipLength = sprintf(buf, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+            ipLength = snprintf(buf, 64, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
         } else {
-            ipLength = sprintf(buf, "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+            ipLength = snprintf(buf, 64, "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11],
                 b[12], b[13], b[14], b[15]);
         }
@@ -271,7 +278,7 @@ protected:
                     /* Fall through to default return */
                 } else {
                     /* Strategy differences between SSL and non-SSL regarding syscall minimizing */
-                    if constexpr (SSL) {
+                    if constexpr (false) {
                         /* Cork up as much as we can */
                         unsigned int stripped = LoopData::CORK_BUFFER_SIZE - loopData->corkOffset;
                         memcpy(loopData->corkBuffer + loopData->corkOffset, src, stripped);
